@@ -1,5 +1,6 @@
 const whatsappService = require('../services/whatsappService');
 const s3Service = require('../services/s3Service');
+const transcriptionService = require('../services/transcriptionService');
 const logger = require('../utils/logger');
 
 class WebhookController {
@@ -159,6 +160,177 @@ class WebhookController {
       }
 
       throw error;
+    }
+  }
+}
+
+
+  /**
+   * معالجة رسالة وسائط محدثة (مع دعم التحويل الصوتي)
+   */
+  async processMediaMessage(message, webhookValue) {
+    const messageId = message.id;
+    const from = message.from;
+    const timestamp = message.timestamp;
+    const messageType = message.type;
+    const mediaInfo = message[messageType];
+
+    try {
+      logger.info(`📨 معالجة ${messageType} من ${from}, ID: ${messageId}`);
+
+      // 1. التحقق من وجود ملف مكرر
+      const duplicate = await s3Service.checkDuplicate(mediaInfo.id, from);
+      if (duplicate) {
+        logger.info(`ملف مكرر: ${mediaInfo.id}`);
+        
+        // إذا كان الملف صوتي، نحاول جلب النص السابق
+        if (messageType === 'audio') {
+          const oldTranscript = await transcriptionService.getTranscription(mediaInfo.id, from);
+          if (oldTranscript) {
+            await whatsappService.sendNotification(
+              from,
+              `📝 النص المستخرج مسبقاً:\n${oldTranscript.text}`
+            );
+          }
+        }
+        
+        return { status: 'duplicate' };
+      }
+
+      // 2. تحميل الملف من واتساب
+      const mediaData = await whatsappService.downloadMedia(mediaInfo.id);
+
+      // 3. رفع الملف إلى S3
+      const s3Result = await s3Service.uploadFile(mediaData.stream, {
+        from,
+        mediaId: mediaInfo.id,
+        timestamp,
+        mimeType: mediaInfo.mime_type,
+        fileExtension: mediaData.fileExtension,
+        messageId
+      });
+
+      // 4. إذا كان الملف صوتي، نبدأ عملية التحويل إلى نص
+      if (messageType === 'audio' && process.env.AUDIO_TRANSCRIPTION_ENABLED === 'true') {
+        // نبدأ التحويل في الخلفية (لا ننتظر اكتماله)
+        this.transcribeAudioInBackground(mediaData, {
+          mediaId: mediaInfo.id,
+          from,
+          mimeType: mediaInfo.mime_type,
+          timestamp
+        });
+        
+        // نرسل إشعار فوري بأن الصوت قيد المعالجة
+        await whatsappService.sendNotification(
+          from,
+          "🎤 تم استلام رسالتك الصوتية، جاري تحويلها إلى نص..."
+        );
+      } else {
+        // إرسال إشعار عادي للملفات غير الصوتية
+        await whatsappService.sendNotification(
+          from,
+          `✅ تم استلام ملفك بنجاح: ${mediaInfo.mime_type}`
+        );
+      }
+
+      // 5. تسجيل العملية
+      logger.info({
+        message: 'تمت معالجة الملف بنجاح',
+        from,
+        messageId,
+        mediaId: mediaInfo.id,
+        s3Location: s3Result.location,
+        mimeType: mediaInfo.mime_type,
+        size: mediaData.contentLength
+      });
+
+      return { status: 'success', s3Result };
+
+    } catch (error) {
+      logger.error(`فشل معالجة الرسالة ${messageId}:`, error);
+      
+      // إشعار العميل بالخطأ
+      await whatsappService.sendNotification(
+        from,
+        '❌ عذراً، حدث خطأ أثناء معالجة ملفك. الرجاء المحاولة مرة أخرى.'
+      );
+
+      throw error;
+    }
+  }
+
+  /**
+   * تحويل الصوت إلى نص في الخلفية
+   */
+  async transcribeAudioInBackground(mediaData, options) {
+    const { mediaId, from, mimeType, timestamp } = options;
+
+    try {
+      logger.info(`🔄 بدء تحويل الصوت في الخلفية: ${mediaId}`);
+
+      // إعادة إنشاء stream للصوت (لأنه قد استهلك في الرفع)
+      const audioStream = await whatsappService.downloadMedia(mediaId);
+
+      // تحويل الصوت إلى نص
+      const transcription = await transcriptionService.transcribeAudio(
+        audioStream.stream,
+        {
+          mediaId,
+          from,
+          mimeType,
+          language: 'ar' // يمكن جعلها ديناميكية حسب رقم المرسل
+        }
+      );
+
+      // إرسال النص للعميل عبر واتساب
+      await whatsappService.sendNotification(
+        from,
+        `📝 **النص المستخرج من رسالتك الصوتية:**\n\n${transcription.text}`
+      );
+
+      // إذا كانت دقة التحويل منخفضة، نرسل تحذير
+      if (transcription.confidence < 0.7) {
+        await whatsappService.sendNotification(
+          from,
+          "⚠️ دقة التحويل منخفضة، قد يكون الصوت غير واضح."
+        );
+      }
+
+      logger.info(`✅ اكتمل تحويل الصوت وإرساله: ${mediaId}`);
+
+    } catch (error) {
+      logger.error(`فشل تحويل الصوت في الخلفية ${mediaId}:`, error);
+      
+      // إشعار العميل بالفشل
+      await whatsappService.sendNotification(
+        from,
+        "❌ عذراً، فشل تحويل رسالتك الصوتية إلى نص. الرجاء المحاولة مرة أخرى."
+      );
+    }
+  }
+
+  /**
+   * استعلام عن نص رسالة صوتية
+   */
+  async getTranscript(req, res) {
+    const { mediaId, from } = req.query;
+
+    if (!mediaId || !from) {
+      return res.status(400).json({ error: 'mediaId and from are required' });
+    }
+
+    try {
+      const transcript = await transcriptionService.getTranscription(mediaId, from);
+      
+      if (!transcript) {
+        return res.status(404).json({ error: 'Transcript not found' });
+      }
+
+      res.json(transcript);
+
+    } catch (error) {
+      logger.error('فشل استرجاع النص:', error);
+      res.status(500).json({ error: 'Failed to retrieve transcript' });
     }
   }
 }
