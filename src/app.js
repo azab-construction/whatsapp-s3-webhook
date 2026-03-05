@@ -45,10 +45,10 @@ app.use((err, req, res, next) => {
     message: process.env.NODE_ENV === 'development' ? err.message : undefined
   });
 });
-
+// Route للاستعلام عن النصوص المستخرجة
+app.get('/api/transcript', webhookController.getTranscript);
 // 404 للمسارات غير الموجودة
 app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Route not found' });
+res.status(404).json({ error: 'Route not found' });
 });
-
 module.exports = app;
